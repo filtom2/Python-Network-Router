@@ -8,11 +8,7 @@ from scapy.all import sniff, sendp, Ether, ARP, conf, get_if_hwaddr
 
 # 192.168.01 / 25
 # 172.16.0.1 / 30
-
-
-# TODO change arp delete address to clear all entries in the arp table
-# TODO change arp timer to confirm it /w input text field (default 120s)
-
+#TODO staticke routovanie, rekurzivne routovanie, proxy arp
 class Iface:
     def __init__(self, label, phys_iface):
         self.label = label
@@ -52,7 +48,7 @@ def arp_snapshot():
 
 
 def start_sniffer(iface: Iface):
-    """Sniff ARP packets and respond to queries for our virtual IP."""
+    """Sniff ARP packets and respond to queries for our virtual IP"""
     def handle(pkt):
         if not pkt.haslayer(ARP):
             return
