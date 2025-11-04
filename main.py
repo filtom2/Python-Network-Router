@@ -2,13 +2,15 @@ import sys
 import time
 import threading
 import random
+import ipaddress
 from tkinter import *
 from tkinter import ttk, messagebox
 from scapy.all import sniff, sendp, Ether, ARP, conf, get_if_hwaddr
 
 # 192.168.01 / 25
 # 172.16.0.1 / 30
-#TODO staticke routovanie, rekurzivne routovanie, proxy arp
+# TODO staticke routovanie, rekurzivne routovanie, proxy arp
+
 class Iface:
     def __init__(self, label, phys_iface):
         self.label = label
@@ -47,25 +49,44 @@ def arp_snapshot():
         return {k: v.copy() for k, v in arp_table.items()}
 
 
+def _ip_in_iface_network(target_ip: str, obj: Iface) -> bool:
+    """Return True if target_ip is inside obj's configured network."""
+    if not obj.virt_ip or not obj.netmask:
+        return False
+    try:
+        net = ipaddress.ip_network(f"{obj.virt_ip}/{obj.netmask}", strict=False)
+        return ipaddress.ip_address(target_ip) in net
+    except Exception:
+        return False
+
+
 def start_sniffer(iface: Iface):
-    """Sniff ARP packets and respond to queries for our virtual IP"""
+    """Sniff ARP packets and respond to queries for our virtual IP and act as proxy ARP.
+
+    Behavior:
+    - If ARP reply: learn mapping into arp_table.
+    - If ARP request for one of our configured virt_ip -> reply with this interface's MAC.
+    - If ARP request for IP inside *other interface's* network -> send a proxy-ARP reply (proxy on receiving iface).
+    """
     def handle(pkt):
         if not pkt.haslayer(ARP):
             return
         arp = pkt.getlayer(ARP)
- 
+
         # Ignore our own ARP packets
         if arp.hwsrc in [get_if_hwaddr(i.phys) for i in interfaces.values()]:
             return
 
-        # Learn  ARP replies
+        # Learn ARP replies
         if arp.op == 2 and arp.psrc and arp.hwsrc:
             arp_update(arp.psrc, arp.hwsrc)
             return
 
-        # Respond to ARP requests for our IP
+        # Handle ARP requests
         if arp.op == 1:
             target = arp.pdst
+
+            # 1) If it's exactly one of our configured IPs, answer from that interface
             for obj in interfaces.values():
                 if obj.virt_ip is None:
                     continue
@@ -82,9 +103,33 @@ def start_sniffer(iface: Iface):
                         arp_update(arp.psrc, arp.hwsrc)
                     return
 
-        if not pkt.haslayer(ARP):
-            return
-        arp = pkt.getlayer(ARP)
+            # 2) Proxy ARP: if target is within network of any other interface, reply on the receiving iface
+            for other in interfaces.values():
+                # skip self
+                if other == iface:
+                    continue
+                # skip if other has no network configured or it's the same interface that received the request
+                if other.virt_ip is None or other.netmask is None:
+                    continue
+                # If the target IP lies in the 'other' interface's subnet, we can proxy
+                try:
+                    if _ip_in_iface_network(target, other):
+                        # Craft proxy reply that tells requester: "I (this interface) own that IP"
+                        proxy_src_mac = get_if_hwaddr(iface.phys)
+                        reply = Ether(dst=pkt[Ether].src, src=proxy_src_mac) / ARP(
+                            op=2,
+                            hwsrc=proxy_src_mac,
+                            psrc=target,
+                            hwdst=arp.hwsrc,
+                            pdst=arp.psrc
+                        )
+                        sendp(reply, iface=iface.phys, verbose=False)
+                        # Also learn the requester (so GUI shows who asked)
+                        if arp.psrc and arp.hwsrc:
+                            arp_update(arp.psrc, arp.hwsrc)
+                        return
+                except Exception:
+                    continue
 
     def loop():
         while not iface._stop.is_set():
@@ -147,6 +192,7 @@ class App:
             mask_e.grid(row=1, column=1)
             mask_e.insert(0, "255.255.255.0")
             Button(f, text="Apply", command=lambda L=label: self.apply_iface(L)).grid(row=2, column=0, columnspan=2, pady=4)
+            Label(f, text=f"MAC: {get_if_hwaddr(interfaces[label].phys)}").grid(row=3, column=0, columnspan=2, sticky=W)
             self.if_widgets[label] = {"ip": ip_e, "mask": mask_e}
 
         # ARP request button
@@ -216,13 +262,6 @@ class App:
             arp_ttl = 120
         messagebox.showinfo("ARP TTL", f"ARP TTL updated to {arp_ttl} seconds")
 
-    def set_ttl(self):
-        global arp_ttl
-        try:
-            arp_ttl = int(self.ttl_spin.get())
-        except ValueError:
-            arp_ttl = 120
-
     def periodic(self):
         now = time.time()
         with arp_lock:
@@ -271,6 +310,7 @@ def main():
         pass
     finally:
         app.shutdown()
+
 
 if __name__ == "__main__":
     main()
