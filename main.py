@@ -251,7 +251,6 @@ def start_sniffer(iface: Iface):
 
 
 def start_ip_forwarder(iface: Iface):
-    # Basic IP forwarding between interfaces using routing_table and ARP resolution
     def handle(pkt):
         if not pkt.haslayer(IP):
             return
@@ -459,11 +458,17 @@ class App:
             for ip in expired:
                 del arp_table[ip]
         snap = arp_snapshot()
+        # Store current selection
+        selected = self.tree.selection()
         for r in self.tree.get_children():
             self.tree.delete(r)
         for ip, info in sorted(snap.items()):
             age = int(now - info["ts"])
             self.tree.insert("", "end", iid=ip, values=(info["mac"], str(age)))
+        # Restore selection if still valid
+        for sel in selected:
+            if sel in self.tree.get_children():
+                self.tree.selection_add(sel)
         try:
             self.update_rt_view()
         except Exception:
@@ -555,10 +560,16 @@ class App:
 
     # Refresh displayed routing table
     def update_rt_view(self):
+        # Store current selection
+        selected = self.rt_tree.selection()
         for r in self.rt_tree.get_children():
             self.rt_tree.delete(r)
         for r in route_snapshot():
             self.rt_tree.insert("", "end", values=(f"{r['dest']}/{r['prefix']}", r["mask"], r["iface"], r["next_hop"], r["type"]))
+        # Restore selection if still valid
+        for sel in selected:
+            if sel in self.rt_tree.get_children():
+                self.rt_tree.selection_add(sel)
 
 
 # --- main entrypoint ---
