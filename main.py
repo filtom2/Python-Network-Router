@@ -1,7 +1,5 @@
-import sys
 import time
 import threading
-import random
 import ipaddress
 import struct
 import socket
@@ -57,12 +55,38 @@ class Iface:
         # RIP
         self.rip_enabled = False
         self.rip_thread = None
-        # Cache MAC address robustlysu
-        self.mac = _get_mac_robust(phys_iface)
+        # Cache MAC address
+        self.mac = _get_mac_robust(phys_iface) if phys_iface else "00:00:00:00:00:00"
 
 
-PORT1 = "en8"
-PORT2 = "en5"
+def get_available_interfaces():
+    """Get list of all available network interfaces"""
+    ifaces = []
+    try:
+        # Try using netifaces if available
+        import netifaces
+        ifaces = netifaces.interfaces()
+    except ImportError:
+        # Fallback: parse ifconfig output
+        try:
+            output = subprocess.check_output(["ifconfig", "-l"], stderr=subprocess.DEVNULL).decode()
+            ifaces = output.strip().split()
+        except Exception:
+            # Last resort: try common interface names
+            ifaces = ["en0", "en1", "en2", "en3", "en4", "en5", "en6", "en7", "en8", "en9", "en10"]
+    
+    # Filter out loopback and virtual interfaces
+    filtered = []
+    for iface in ifaces:
+        if iface.startswith("lo"):  # loopback
+            continue
+        if iface.startswith("gif") or iface.startswith("stf"):  # tunnels
+            continue
+        if iface.startswith("bridge") or iface.startswith("p2p"):
+            continue
+        filtered.append(iface)
+    
+    return sorted(filtered) if filtered else ["en0"]
 
 interfaces = {}
 arp_table = {}
@@ -424,6 +448,25 @@ def _translate_inside_to_outside(pkt, in_iface, out_iface):
         del new_pkt['UDP'].chksum
         return new_pkt
     
+    # Handle ICMP Echo Request (ping) - use ICMP ID as the "port" for PAT
+    elif pkt.haslayer(ICMP) and pkt[ICMP].type == 8:  # Echo Request
+        inside_icmp_id = pkt[ICMP].id
+        key = (inside_ip, inside_icmp_id, socket.IPPROTO_ICMP)
+        
+        with nat_lock:
+            if key in pat_table:
+                _, outside_icmp_id, _ = pat_table[key]
+            else:
+                # Allocate new ICMP ID
+                outside_icmp_id = _allocate_pat_port() & 0xFFFF  # ICMP ID is 16-bit
+            pat_table[key] = (outside_ip, outside_icmp_id, time.time())
+        
+        new_pkt[IP].src = outside_ip
+        new_pkt[ICMP].id = outside_icmp_id
+        del new_pkt[IP].chksum
+        del new_pkt[ICMP].chksum
+        return new_pkt
+    
     return pkt
 
 def _translate_outside_to_inside(pkt, in_iface, out_iface):
@@ -504,6 +547,19 @@ def _translate_outside_to_inside(pkt, in_iface, out_iface):
                     pat_table[(inside_ip, inside_port, proto)] = (outside_ip, outside_port, time.time())
                     del new_pkt[IP].chksum
                     del new_pkt['UDP'].chksum
+                    return new_pkt
+    
+    # ICMP Echo Reply PAT reverse lookup
+    elif pkt.haslayer(ICMP) and pkt[ICMP].type == 0:  # Echo Reply
+        dst_icmp_id = pkt[ICMP].id
+        with nat_lock:
+            for (inside_ip, inside_icmp_id, proto), (outside_ip, outside_icmp_id, ts) in pat_table.items():
+                if proto == socket.IPPROTO_ICMP and outside_ip == dst_ip and outside_icmp_id == dst_icmp_id:
+                    new_pkt[IP].dst = inside_ip
+                    new_pkt[ICMP].id = inside_icmp_id
+                    pat_table[(inside_ip, inside_icmp_id, proto)] = (outside_ip, outside_icmp_id, time.time())
+                    del new_pkt[IP].chksum
+                    del new_pkt[ICMP].chksum
                     return new_pkt
     
     return pkt
@@ -799,8 +855,26 @@ def start_ip_forwarder(iface: Iface):
                         pass
                 return
         
-        # 3. Routing Lookup
-        route, arp_target = route_lookup(dst)
+        # 3. NAT Pre-processing for Outside ->Inside traffic
+        # Must translate BEFORE route lookup so we route to the correct inside destination
+        nat_translated = False
+        translated_dst = dst
+        
+        if nat_enabled and nat_if_type.get(in_iface.label) == 'outside':
+            inside_ifaces = [lbl for lbl, typ in nat_if_type.items() if typ == 'inside']
+            if inside_ifaces:
+                # Translation with a temporary out_iface (any inside interface)
+                # The routing will determine the real out_iface
+                temp_out_iface = interfaces.get(inside_ifaces[0])
+                if temp_out_iface:
+                    translated = _translate_outside_to_inside(pkt, in_iface, temp_out_iface)
+                    if translated and translated[IP].dst != dst:
+                        pkt = translated
+                        translated_dst = pkt[IP].dst
+                        nat_translated = True
+        
+        # 4. Routing Lookup (using possibly translated destination)
+        route, arp_target = route_lookup(translated_dst)
         if not route:
             return
             
@@ -811,10 +885,22 @@ def start_ip_forwarder(iface: Iface):
         out_iface = interfaces.get(out_iface_label)
         if not out_iface:
             return
-            
-        nh = arp_target or dst
         
-        # 4. ARP Resolution
+        # 5. NAT Translation for Inside -> Outside traffic
+        # This happens after route lookup (correct for outbound traffic)
+        if nat_enabled and not nat_translated:
+            if nat_if_type.get(in_iface.label) == 'inside' and nat_if_type.get(out_iface.label) == 'outside':
+                translated = _translate_inside_to_outside(pkt, in_iface, out_iface)
+                if translated:
+                    pkt = translated
+        
+        # 6. ARP Resolution
+        # For NAT-translated packets, we need to ARP for the translated destination
+        if nat_translated:
+            nh = translated_dst
+        else:
+            nh = arp_target or dst
+            
         with arp_lock:
             arp_entry = arp_table.get(nh)
             
@@ -825,19 +911,8 @@ def start_ip_forwarder(iface: Iface):
             
         dst_mac = arp_entry['mac']
         out_src_mac = out_iface.mac
-        
-        # NAT Translation
-        # Translate 'pkt' BEFORE processing IP payload
-        if nat_if_type.get(in_iface.label) == 'inside' and nat_if_type.get(out_iface.label) == 'outside':
-            translated = _translate_inside_to_outside(pkt, in_iface, out_iface)
-            if translated:
-                pkt = translated
-        elif nat_if_type.get(in_iface.label) == 'outside' and nat_if_type.get(out_iface.label) == 'inside':
-            translated = _translate_outside_to_inside(pkt, in_iface, out_iface)
-            if translated:
-                pkt = translated
 
-        # 5. Spracovanie paketu (TTL + Checksums)
+        # 7. Processing packet (TTL + Checksums)
         
         # TTL Check
         if pkt[IP].ttl <= 1:
@@ -848,12 +923,10 @@ def start_ip_forwarder(iface: Iface):
         ip_payload = pkt[IP].copy()
         ip_payload.ttl -= 1
         
-        # --- FIX: Vymazanie VŠETKÝCH checksumov ---
-        # Tým donútime Scapy, aby ich vypočítalo nanovo a správne.
-        
+        # Recalculate checksums
         del ip_payload.chksum          # IP Checksum
         if hasattr(ip_payload, "len"):
-            del ip_payload.len         # IP Length (Scapy si to dopočíta)
+            del ip_payload.len         # IP Length
             
         if ip_payload.haslayer(UDP):
             del ip_payload[UDP].chksum # UDP Checksum
@@ -864,7 +937,7 @@ def start_ip_forwarder(iface: Iface):
         if ip_payload.haslayer(ICMP):
             del ip_payload[ICMP].chksum
 
-        # Zložíme nový paket
+        # Rebuild the packet
         new_pkt = Ether(src=out_src_mac, dst=dst_mac) / ip_payload
 
         try:
@@ -876,7 +949,6 @@ def start_ip_forwarder(iface: Iface):
     def loop():
         while not iface._stop.is_set():
             try:
-                # Filter 'ip' je dôležitý pre rýchlosť
                 sniff(iface=iface.phys, prn=handle, filter="ip", store=False, timeout=1)
             except Exception:
                 time.sleep(1)
@@ -963,46 +1035,97 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("SWRouter")
-        print(f"Router starting on {PORT1} and {PORT2}")
-
-        interfaces["port1"] = Iface(label="port1", phys_iface=PORT1)
-        interfaces["port2"] = Iface(label="port2", phys_iface=PORT2)
-        # start ARP sniffers first
-        start_sniffer(interfaces["port1"])
-        start_sniffer(interfaces["port2"])
-        # forwarders
-        interfaces["port1"].forwarder = start_ip_forwarder(interfaces["port1"])
-        interfaces["port2"].forwarder = start_ip_forwarder(interfaces["port2"])
-        # start global RIP sender thread
+        root.geometry("1050x750")  # Set reasonable window size
+        
+        # Create scrollable container
+        main_canvas = Canvas(root)
+        scrollbar = Scrollbar(root, orient=VERTICAL, command=main_canvas.yview)
+        self.scrollable_frame = Frame(main_canvas)
+        
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: main_canvas.configure(scrollregion=main_canvas.bbox("all"))
+        )
+        
+        main_canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        main_canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Pack scrollbar and canvas
+        scrollbar.pack(side=RIGHT, fill=Y)
+        main_canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        
+        # Enable mouse wheel scrolling
+        def _on_mousewheel(event):
+            main_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        main_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        
+        # Get available interfaces
+        self.available_ifaces = get_available_interfaces()
+        print(f"Available interfaces: {self.available_ifaces}")
+        
+        # Initialize with first two available interfaces (or same if only one)
+        default_iface1 = self.available_ifaces[0] if self.available_ifaces else "en0"
+        default_iface2 = self.available_ifaces[1] if len(self.available_ifaces) > 1 else default_iface1
+        
+        # Create interface objects (but don't start sniffers yet - wait for user to select)
+        interfaces["port1"] = Iface(label="port1", phys_iface=None)
+        interfaces["port2"] = Iface(label="port2", phys_iface=None)
+        
+        # Start global RIP sender thread
         t = threading.Thread(target=_rip_periodic_sender, daemon=True)
         t.start()
 
-        # Layout 
-        self.if_frame = Frame(root)
+        # Layout - use scrollable_frame instead of root
+        self.if_frame = Frame(self.scrollable_frame)
         self.if_frame.pack(fill=X, padx=6, pady=6)
         self.if_widgets = {}
 
-        for label in ("port1", "port2"):
+        for idx, label in enumerate(("port1", "port2")):
             f = LabelFrame(self.if_frame, text=label)
-            f.pack(side=LEFT, padx=6, pady=6)
-            Label(f, text="Virt IP:").grid(row=0, column=0, sticky=W)
-            ip_e = Entry(f, width=20)
-            ip_e.grid(row=0, column=1)
-            Label(f, text="Netmask:").grid(row=1, column=0, sticky=W)
-            mask_e = Entry(f, width=20)
-            mask_e.grid(row=1, column=1)
+            f.pack(side=LEFT, padx=6, pady=6, fill=BOTH, expand=True)
+            
+            # Physical interface selection dropdown
+            Label(f, text="Interface:").grid(row=0, column=0, sticky=W)
+            iface_var = StringVar(value="-- Select --")
+            iface_menu = OptionMenu(f, iface_var, "-- Select --", *self.available_ifaces,
+                                   command=lambda v, L=label: self.change_physical_iface(L))
+            iface_menu.config(width=12)
+            iface_menu.grid(row=0, column=1, sticky=W)
+            
+            # MAC address label (will update when interface is selected)
+            mac_label = Label(f, text="MAC: --")
+            mac_label.grid(row=1, column=0, columnspan=2, sticky=W)
+            
+            # Virtual IP configuration
+            Label(f, text="Virt IP:").grid(row=2, column=0, sticky=W)
+            ip_e = Entry(f, width=18)
+            ip_e.grid(row=2, column=1)
+            Label(f, text="Netmask:").grid(row=3, column=0, sticky=W)
+            mask_e = Entry(f, width=18)
+            mask_e.grid(row=3, column=1)
             mask_e.insert(0, "255.255.255.0")
-            Button(f, text="Apply", command=lambda L=label: self.apply_iface(L)).grid(row=2, column=0, columnspan=2, pady=4)
-            # Use cached MAC from Iface object
-            Label(f, text=f"MAC: {interfaces[label].mac}").grid(row=3, column=0, columnspan=2, sticky=W)
+            Button(f, text="Apply IP", command=lambda L=label: self.apply_iface(L)).grid(row=4, column=0, columnspan=2, pady=4)
+            
             # RIP enable checkbox
-            var = IntVar(value=0)
-            cb = Checkbutton(f, text="RIP v2", variable=var, command=lambda v=var, L=label: self.toggle_rip(L, v))
-            cb.grid(row=4, column=0, columnspan=2)
-            self.if_widgets[label] = {"ip": ip_e, "mask": mask_e, "rip_var": var}
+            rip_var = IntVar(value=0)
+            cb = Checkbutton(f, text="RIP v2", variable=rip_var, command=lambda v=rip_var, L=label: self.toggle_rip(L, v))
+            cb.grid(row=5, column=0, columnspan=2)
+            
+            # Status label
+            status_label = Label(f, text="Status: Not connected", fg="gray")
+            status_label.grid(row=6, column=0, columnspan=2, sticky=W)
+            
+            self.if_widgets[label] = {
+                "ip": ip_e, 
+                "mask": mask_e, 
+                "rip_var": rip_var,
+                "iface_var": iface_var,
+                "mac_label": mac_label,
+                "status_label": status_label
+            }
 
         # ARP request button
-        arp_frame = LabelFrame(root, text="ARP request (who-has)")
+        arp_frame = LabelFrame(self.scrollable_frame, text="ARP request (who-has)")
         arp_frame.pack(fill=X, padx=6, pady=6)
         Label(arp_frame, text="From:").grid(row=0, column=0, sticky=W)
         self.arp_from = StringVar(value="port1")
@@ -1013,7 +1136,7 @@ class App:
         Button(arp_frame, text="Send ARP", command=self.arp_send).grid(row=0, column=4, padx=6)
 
         # TTL 
-        ttl_frame = Frame(root)
+        ttl_frame = Frame(self.scrollable_frame)
         ttl_frame.pack(fill=X, padx=6, pady=2)
         Label(ttl_frame, text="ARP TTL (s):").pack(side=LEFT)
         self.ttl_entry = Entry(ttl_frame, width=6)
@@ -1022,7 +1145,7 @@ class App:
         Button(ttl_frame, text="Confirm TTL", command=self.confirm_ttl).pack(side=LEFT, padx=4)
 
         # RIP timers
-        rip_timer_frame = LabelFrame(root, text="RIP Timers (seconds)")
+        rip_timer_frame = LabelFrame(self.scrollable_frame, text="RIP Timers (seconds)")
         rip_timer_frame.pack(fill=X, padx=6, pady=6)
         
         Label(rip_timer_frame, text="Update:").grid(row=0, column=0, sticky=W, padx=4)
@@ -1046,35 +1169,100 @@ class App:
         # routing GUI init
         self._init_routing_gui()
         
-        # NAT GUI init
-        self._init_nat_gui()
-
         # ARP table
-        table_frame = Frame(root)
-        table_frame.pack(fill=BOTH, expand=True, padx=6, pady=6)
-        self.tree = ttk.Treeview(table_frame, columns=("mac", "age"), show="headings")
+        arp_table_frame = LabelFrame(self.scrollable_frame, text="ARP Cache")
+        arp_table_frame.pack(fill=X, padx=6, pady=3)
+        
+        table_inner = Frame(arp_table_frame)
+        table_inner.pack(fill=X, padx=4, pady=2)
+        
+        self.tree = ttk.Treeview(table_inner, columns=("ip", "mac", "age"), show="headings", height=3)
+        self.tree.heading("ip", text="IP Address")
         self.tree.heading("mac", text="MAC")
         self.tree.heading("age", text="Age(s)")
-        self.tree.column("mac", width=160)
-        self.tree.column("age", width=80, anchor=CENTER)
-        self.tree.pack(fill=BOTH, expand=True, side=LEFT)
-        scrollbar = Scrollbar(table_frame, orient=VERTICAL, command=self.tree.yview)
+        self.tree.column("ip", width=120)
+        self.tree.column("mac", width=140)
+        self.tree.column("age", width=60, anchor=CENTER)
+        self.tree.pack(fill=X, side=LEFT)
+        scrollbar = Scrollbar(table_inner, orient=VERTICAL, command=self.tree.yview)
         scrollbar.pack(side=RIGHT, fill=Y)
         self.tree.configure(yscroll=scrollbar.set)
-
+        
         # Button frame for ARP actions
-        btn_frame = Frame(root)
-        btn_frame.pack(fill=X, padx=6, pady=4)
+        btn_frame = Frame(arp_table_frame)
+        btn_frame.pack(fill=X, padx=4, pady=2)
         Button(btn_frame, text="Clear ARP Cache", command=lambda: self.delete_selected(all=True)).pack(side=LEFT)
         Button(btn_frame, text="Delete Selected", command=lambda: self.delete_selected(all=False)).pack(side=LEFT, padx=6)
+        
+        # NAT GUI init
+        self._init_nat_gui()
 
         self._running = True
         self.root.after(1000, self.periodic)
 
     # Handlers
+    def change_physical_iface(self, label):
+        """Change the physical interface for a port"""
+        w = self.if_widgets[label]
+        selected = w["iface_var"].get()
+        
+        if selected == "-- Select --":
+            return
+        
+        obj = interfaces[label]
+        
+        # Stop existing sniffers/forwarders if running
+        if obj.phys is not None:
+            obj._stop.set()
+            if obj.sniffer:
+                try:
+                    obj.sniffer.join(timeout=1)
+                except:
+                    pass
+            if obj.forwarder:
+                try:
+                    obj.forwarder.join(timeout=1)
+                except:
+                    pass
+            if obj.rip_thread:
+                try:
+                    obj.rip_thread.join(timeout=1)
+                except:
+                    pass
+        
+        # Update the interface
+        obj.phys = selected
+        obj._stop = threading.Event()  # Reset stop event
+        obj.mac = _get_mac_robust(selected)
+        obj.sniffer = None
+        obj.forwarder = None
+        obj.rip_thread = None
+        
+        # Start new sniffers/forwarders
+        start_sniffer(obj)
+        obj.forwarder = start_ip_forwarder(obj)
+        
+        # If RIP was enabled, restart RIP listener
+        if obj.rip_enabled:
+            t = threading.Thread(target=_rip_listener_loop, args=(obj,), daemon=True)
+            obj.rip_thread = t
+            t.start()
+        
+        # Update UI
+        w["mac_label"].config(text=f"MAC: {obj.mac}")
+        w["status_label"].config(text=f"Status: Connected ({selected})", fg="green")
+        
+        print(f"{label} now using interface: {selected} (MAC: {obj.mac})")
+
     def apply_iface(self, label):
         w = self.if_widgets[label]
         obj = interfaces[label]
+        
+        # Check if physical interface is selected
+        if obj.phys is None:
+            messagebox.showwarning("Warning", f"Please select a physical interface for {label} first")
+            return
+        
         old_net = _make_iface_network(obj)
         ip = w["ip"].get().strip()
         mask = w["mask"].get().strip()
@@ -1170,7 +1358,7 @@ class App:
             self.tree.delete(r)
         for ip, info in sorted(snap.items()):
             age = int(now - info["ts"])
-            self.tree.insert("", "end", iid=ip, values=(info["mac"], str(age)))
+            self.tree.insert("", "end", iid=ip, values=(ip, info["mac"], str(age)))
         # Restore selection if still valid
         for sel in selected:
             if sel in self.tree.get_children():
@@ -1257,7 +1445,7 @@ class App:
 
     # Routing GUI and handlers
     def _init_routing_gui(self):
-        rt_frame = LabelFrame(self.root, text="Static / Dynamic Routes")
+        rt_frame = LabelFrame(self.scrollable_frame, text="Static / Dynamic Routes")
         rt_frame.pack(fill=X, padx=6, pady=6)
         Label(rt_frame, text="Dest:").grid(row=0, column=0, sticky=W)
         self.rt_dest = Entry(rt_frame, width=15); self.rt_dest.grid(row=0, column=1)
@@ -1272,7 +1460,7 @@ class App:
         Button(rt_frame, text="Remove Route", command=self.remove_route).grid(row=0, column=9, padx=6)
 
         # Table for displaying routes (includes Dest)
-        self.rt_tree = ttk.Treeview(rt_frame, columns=("dest","mask", "iface", "nh", "type", "metric"), show="headings")
+        self.rt_tree = ttk.Treeview(rt_frame, columns=("dest","mask", "iface", "nh", "type", "metric"), show="headings", height=4)
         self.rt_tree.heading("dest", text="Dest")
         self.rt_tree.heading("mask", text="Mask")
         self.rt_tree.heading("iface", text="Iface")
@@ -1341,7 +1529,7 @@ class App:
     # NAT GUI and handlers
     def _init_nat_gui(self):
         """Initialize NAT GUI components"""
-        nat_frame = LabelFrame(self.root, text="NAT Configuration")
+        nat_frame = LabelFrame(self.scrollable_frame, text="NAT Configuration")
         nat_frame.pack(fill=BOTH, expand=True, padx=6, pady=6)
         
         # Enable/Disable NAT + Clear button
